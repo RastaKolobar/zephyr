@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <init.h>
 #include <fs/fs.h>
+#include <fs/fs_sys.h>
 
 #define LFS_LOG_REGISTER
 #include <lfs_util.h>
@@ -25,7 +26,7 @@
 struct lfs_file_data {
 	struct lfs_file file;
 	struct lfs_file_config config;
-	struct k_mem_block cache_block;
+	void *cache_block;
 };
 
 #define LFS_FILEP(fp) (&((struct lfs_file_data *)(fp->filep))->file)
@@ -46,10 +47,9 @@ BUILD_ASSERT(CONFIG_FS_LITTLEFS_CACHE_SIZE >= 4);
 #define CONFIG_FS_LITTLEFS_FC_MEM_POOL_NUM_BLOCKS CONFIG_FS_LITTLEFS_NUM_FILES
 #endif
 
-K_MEM_POOL_DEFINE(file_cache_pool,
-		  CONFIG_FS_LITTLEFS_FC_MEM_POOL_MIN_SIZE,
-		  CONFIG_FS_LITTLEFS_FC_MEM_POOL_MAX_SIZE,
-		  CONFIG_FS_LITTLEFS_FC_MEM_POOL_NUM_BLOCKS, 4);
+K_HEAP_DEFINE(file_cache_pool,
+	      CONFIG_FS_LITTLEFS_FC_MEM_POOL_MAX_SIZE *
+	      CONFIG_FS_LITTLEFS_FC_MEM_POOL_NUM_BLOCKS);
 
 static inline void fs_lock(struct fs_littlefs *fs)
 {
@@ -174,21 +174,36 @@ static void release_file_data(struct fs_file_t *fp)
 	struct lfs_file_data *fdp = fp->filep;
 
 	if (fdp->config.buffer) {
-		k_mem_pool_free(&fdp->cache_block);
+		k_heap_free(&file_cache_pool, fdp->cache_block);
 	}
 
 	k_mem_slab_free(&file_data_pool, &fp->filep);
 	fp->filep = NULL;
 }
 
-static int littlefs_open(struct fs_file_t *fp, const char *path)
+static int lfs_flags_from_zephyr(unsigned int zflags)
+{
+	int flags = (zflags & FS_O_CREATE) ? LFS_O_CREAT : 0;
+
+	/* LFS_O_READONLY and LFS_O_WRONLY can be selected at the same time,
+	 * this is not a mistake, together they create RDWR access.
+	 */
+	flags |= (zflags & FS_O_READ) ? LFS_O_RDONLY : 0;
+	flags |= (zflags & FS_O_WRITE) ? LFS_O_WRONLY : 0;
+
+	flags |= (zflags & FS_O_APPEND) ? LFS_O_APPEND : 0;
+
+	return flags;
+}
+
+static int littlefs_open(struct fs_file_t *fp, const char *path,
+			 fs_mode_t zflags)
 {
 	struct fs_littlefs *fs = fp->mp->fs_data;
 	struct lfs *lfs = &fs->lfs;
-	int flags = LFS_O_CREAT | LFS_O_RDWR;
-	int ret;
+	int flags = lfs_flags_from_zephyr(zflags);
+	int ret = k_mem_slab_alloc(&file_data_pool, &fp->filep, K_NO_WAIT);
 
-	ret = k_mem_slab_alloc(&file_data_pool, &fp->filep, K_NO_WAIT);
 	if (ret != 0) {
 		return ret;
 	}
@@ -197,14 +212,14 @@ static int littlefs_open(struct fs_file_t *fp, const char *path)
 
 	memset(fdp, 0, sizeof(*fdp));
 
-	ret = k_mem_pool_alloc(&file_cache_pool, &fdp->cache_block,
-			       lfs->cfg->cache_size, K_NO_WAIT);
-	LOG_DBG("alloc %u file cache: %d", lfs->cfg->cache_size, ret);
-	if (ret != 0) {
+	fdp->cache_block = k_heap_alloc(&file_cache_pool,
+					lfs->cfg->cache_size, K_NO_WAIT);
+	if (fdp->cache_block == NULL) {
+		ret = -ENOMEM;
 		goto out;
 	}
 
-	fdp->config.buffer = fdp->cache_block.data;
+	fdp->config.buffer = fdp->cache_block;
 	path = fs_impl_strip_prefix(path, fp->mp);
 
 	fs_lock(fs);
@@ -521,7 +536,7 @@ static lfs_size_t get_block_size(const struct flash_area *fa)
 		.area = fa,
 		.max_size = 0,
 	};
-	struct device *dev = flash_area_get_device(fa);
+	const struct device *dev = flash_area_get_device(fa);
 
 	flash_page_foreach(dev, get_page_cb, &ctx);
 
@@ -533,7 +548,7 @@ static int littlefs_mount(struct fs_mount_t *mountp)
 	int ret;
 	struct fs_littlefs *fs = mountp->fs_data;
 	unsigned int area_id = (uintptr_t)mountp->storage_dev;
-	struct device *dev;
+	const struct device *dev;
 
 	LOG_INF("LittleFS version %u.%u, disk version %u.%u",
 		LFS_VERSION_MAJOR, LFS_VERSION_MINOR,
@@ -555,8 +570,8 @@ static int littlefs_mount(struct fs_mount_t *mountp)
 		goto out;
 	}
 	LOG_DBG("FS area %u at 0x%x for %u bytes",
-		area_id, (u32_t)fs->area->fa_off,
-		(u32_t)fs->area->fa_size);
+		area_id, (uint32_t)fs->area->fa_off,
+		(uint32_t)fs->area->fa_size);
 
 	dev = flash_area_get_device(fs->area);
 	if (dev == NULL) {
@@ -601,7 +616,7 @@ static int littlefs_mount(struct fs_mount_t *mountp)
 		goto out;
 	}
 
-	s32_t block_cycles = lcp->block_cycles;
+	int32_t block_cycles = lcp->block_cycles;
 
 	if (block_cycles == 0) {
 		block_cycles = CONFIG_FS_LITTLEFS_BLOCK_CYCLES;
@@ -628,7 +643,7 @@ static int littlefs_mount(struct fs_mount_t *mountp)
 	lfs_size_t block_count = fs->area->fa_size / block_size;
 
 	LOG_INF("FS at %s:0x%x is %u 0x%x-byte blocks with %u cycle",
-		dev->config->name, (u32_t)fs->area->fa_off,
+		dev->name, (uint32_t)fs->area->fa_off,
 		block_count, block_size, block_cycles);
 	LOG_INF("sizes: rd %u ; pr %u ; ca %u ; la %u",
 		read_size, prog_size, cache_size, lookahead_size);
@@ -661,14 +676,22 @@ static int littlefs_mount(struct fs_mount_t *mountp)
 
 	/* Mount it, formatting if needed. */
 	ret = lfs_mount(&fs->lfs, &fs->cfg);
-	if (ret < 0) {
+	if (ret < 0 &&
+	    (mountp->flags & FS_MOUNT_FLAG_NO_FORMAT) == 0) {
 		LOG_WRN("can't mount (LFS %d); formatting", ret);
-		ret = lfs_format(&fs->lfs, &fs->cfg);
-		if (ret < 0) {
-			LOG_ERR("format failed (LFS %d)", ret);
-			ret = lfs_to_errno(ret);
+		if ((mountp->flags & FS_MOUNT_FLAG_READ_ONLY) == 0) {
+			ret = lfs_format(&fs->lfs, &fs->cfg);
+			if (ret < 0) {
+				LOG_ERR("format failed (LFS %d)", ret);
+				ret = lfs_to_errno(ret);
+				goto out;
+			}
+		} else {
+			LOG_ERR("can not format read-only system");
+			ret = -EROFS;
 			goto out;
 		}
+
 		ret = lfs_mount(&fs->lfs, &fs->cfg);
 		if (ret < 0) {
 			LOG_ERR("remount after format failed (LFS %d)", ret);
@@ -707,7 +730,7 @@ static int littlefs_unmount(struct fs_mount_t *mountp)
 }
 
 /* File system interface */
-static struct fs_file_system_t littlefs_fs = {
+static const struct fs_file_system_t littlefs_fs = {
 	.open = littlefs_open,
 	.close = littlefs_close,
 	.read = littlefs_read,
@@ -728,10 +751,83 @@ static struct fs_file_system_t littlefs_fs = {
 	.statvfs = littlefs_statvfs,
 };
 
-static int littlefs_init(struct device *dev)
+#define DT_DRV_COMPAT zephyr_fstab_littlefs
+#define FS_PARTITION(inst) DT_PHANDLE_BY_IDX(DT_DRV_INST(inst), partition, 0)
+
+#define DEFINE_FS(inst) \
+static uint8_t __aligned(4) \
+	read_buffer_##inst[DT_INST_PROP(inst, cache_size)]; \
+static uint8_t __aligned(4) \
+	prog_buffer_##inst[DT_INST_PROP(inst, cache_size)]; \
+static uint32_t lookahead_buffer_##inst[DT_INST_PROP(inst, lookahead_size) \
+					/ sizeof(uint32_t)]; \
+BUILD_ASSERT(DT_INST_PROP(inst, read_size) > 0); \
+BUILD_ASSERT(DT_INST_PROP(inst, prog_size) > 0); \
+BUILD_ASSERT(DT_INST_PROP(inst, cache_size) > 0); \
+BUILD_ASSERT(DT_INST_PROP(inst, lookahead_size) > 0); \
+BUILD_ASSERT((DT_INST_PROP(inst, lookahead_size) % 8) == 0); \
+BUILD_ASSERT((DT_INST_PROP(inst, cache_size) \
+	      % DT_INST_PROP(inst, read_size)) == 0); \
+BUILD_ASSERT((DT_INST_PROP(inst, cache_size) \
+	      % DT_INST_PROP(inst, prog_size)) == 0); \
+static struct fs_littlefs fs_data_##inst = { \
+	.cfg = { \
+		.read_size = DT_INST_PROP(inst, read_size), \
+		.prog_size = DT_INST_PROP(inst, prog_size), \
+		.cache_size = DT_INST_PROP(inst, cache_size), \
+		.lookahead_size = DT_INST_PROP(inst, lookahead_size), \
+		.read_buffer = read_buffer_##inst, \
+		.prog_buffer = prog_buffer_##inst, \
+		.lookahead_buffer = lookahead_buffer_##inst, \
+	}, \
+}; \
+struct fs_mount_t FS_FSTAB_ENTRY(DT_DRV_INST(inst)) = { \
+	.type = FS_LITTLEFS, \
+	.mnt_point = DT_INST_PROP(inst, mount_point), \
+	.fs_data = &fs_data_##inst, \
+	.storage_dev = (void *)DT_FIXED_PARTITION_ID(FS_PARTITION(inst)), \
+	.flags = FSTAB_ENTRY_DT_MOUNT_FLAGS(DT_DRV_INST(inst)), \
+};
+
+DT_INST_FOREACH_STATUS_OKAY(DEFINE_FS)
+
+#define REFERENCE_MOUNT(inst) (&FS_FSTAB_ENTRY(DT_DRV_INST(inst))),
+
+static void mount_init(struct fs_mount_t *mp)
 {
-	ARG_UNUSED(dev);
-	return fs_register(FS_LITTLEFS, &littlefs_fs);
+
+	LOG_INF("littlefs partition at %s", mp->mnt_point);
+	if ((mp->flags & FS_MOUNT_FLAG_AUTOMOUNT) != 0) {
+		int rc = fs_mount(mp);
+
+		if (rc < 0) {
+			LOG_ERR("Automount %s failed: %d\n",
+				mp->mnt_point, rc);
+		} else {
+			LOG_INF("Automount %s succeeded\n",
+				mp->mnt_point);
+		}
+	}
 }
 
-SYS_INIT(littlefs_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
+static int littlefs_init(const struct device *dev)
+{
+	ARG_UNUSED(dev);
+	static struct fs_mount_t *partitions[] = {
+		DT_INST_FOREACH_STATUS_OKAY(REFERENCE_MOUNT)
+	};
+
+	int rc = fs_register(FS_LITTLEFS, &littlefs_fs);
+
+	if (rc == 0) {
+		struct fs_mount_t **mpi = partitions;
+
+		while (mpi < (partitions + ARRAY_SIZE(partitions))) {
+			mount_init(*mpi++);
+		}
+	}
+
+	return rc;
+}
+
+SYS_INIT(littlefs_init, POST_KERNEL, 99);
